@@ -5,6 +5,8 @@ from string import punctuation, digits
 from queue import Queue, PriorityQueue
 from threading import Lock, Thread
 from heapq import heappop, heappush, heapify
+import json
+import math
 
 stopwords = nltk.corpus.stopwords.words('portuguese')
 next_query = Queue()
@@ -15,7 +17,11 @@ MAX_THREADS = 100
 num_threads = 0
 mutex_count_threads = Lock()
 
-# def document_at_a_time():
+mutex_print_stdout = Lock()
+
+docid_to_url = {}
+token_to_offsets = {}
+
 
 def check_end_query_processing():
     mutex_count_queries.acquire()
@@ -39,7 +45,7 @@ def preprocess(text):
 def query_preprocess_thread(queries):
     for q in queries:
         prepro_q = preprocess(q)
-        next_query.put(prepro_q)
+        next_query.put((q, prepro_q))
     
     # acabou de preprocessar todas as consultas, entao libera a thread
     global num_threads
@@ -47,18 +53,52 @@ def query_preprocess_thread(queries):
     num_threads -= 1
     mutex_count_threads.release()
 
-def daat_thread(query, index):
+def compute_idf(postings):
+    return math.log(len_index/len(postings)) # numero de documentos que a palavra acontece 
+
+def compute_tf_idf(tf, postings):
+    idf = compute_idf(postings)
+    return tf*idf
+
+def compute_bm25(tf, postings):
+    compute_idf(postings)
+
+def daat_thread(original, query, index, ranker):
     results = []
     heapify(results)
-    for target in (0, len(index)): # tamanho do indice = numero de documentos
+    pos = [0 for i in range(len(query))]
+    print(len_index)
+    for target in range(0, len_index): # tamanho do indice = numero de documentos
         score = 0
-        for term in query:
-            postings = index[term]
-        for (docid, weight) in postings:
-            if docid == target:
-                score += weight # aqui que entra o calculo da metrica
-        postings.after(target)
+        print(target)
+        for i, term in enumerate(query):
+            if term not in token_to_offsets:
+                continue
+
+            with open(index, 'r') as ind:
+                ind.seek(int(token_to_offsets[term]))
+                postings = json.loads(ind.readline())
+
+            for j, (docid, tf) in enumerate(postings[term][pos[i]:]):
+                if docid == target:
+                    print(term, target)
+                    if ranker == 'TFIDF':
+                        # aqui que entra o calculo da metrica
+                        score += compute_tf_idf(tf, postings) 
+                    else:
+                        score += compute_bm25(tf, postings)
+                    pos[i] = j + 1
+                    break
+
         heappush(results, (-1*score, target))
+
+    to_print = {
+        "Query": original, 
+        "Results": 
+    }
+    mutex_print_stdout.acquire()
+
+    mutex_print_stdout.release()
     return results
     
 
@@ -82,7 +122,7 @@ def queries_scheduler():
             break
         
         # pega a proxima consulta na fila
-        query = next_query.get()
+        query, query_p = next_query.get()
         print(query)
         # verifica se pode criar mais uma thread, caso contrário espera 
         global num_threads
@@ -105,10 +145,28 @@ def queries_scheduler():
         count_queries_processed += 1
         mutex_count_queries.release()
 
-def main(path_queries, index):
+def main(path_queries, index, ranker):
     with open(path_queries, 'r') as f_queries:
         queries = f_queries.readlines()
+    
+    with open("save_url_to_docid.txt", 'r') as f:
+        urls = f.readlines()
 
+    for url in urls:
+        splitted = url.split(': ')
+        docid_to_url[splitted[0]] = splitted[1].replace('\n', '')
+    
+    global len_index
+    len_index = len(docid_to_url)
+
+    with open("save_token_offset.txt", 'r') as f:
+        offsets = f.readlines()
+
+    for of in offsets:
+        splitted = of.split(': ')
+        token_to_offsets[splitted[0]] = int(splitted[1].replace('\n', ''))
+
+    print(token_to_offsets['0'])
     global num_queries 
     num_queries = len(queries)
     print(num_queries)
@@ -117,6 +175,12 @@ def main(path_queries, index):
     num_threads += 1
     t = Thread (target = query_preprocess_thread, args = (queries,), daemon = True) 
     t.start()
+
+    t.join()
+
+    original, query = next_query.get()
+    print(query)
+    daat_thread(original, query, index, ranker)
 
     
     # queries_scheduler()
@@ -148,7 +212,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    main(args.queries)
+    main(args.queries, args.index, args.ranker)
 
     
 
