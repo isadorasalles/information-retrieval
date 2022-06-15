@@ -1,27 +1,27 @@
 import sys
 import resource
 import argparse
-from bs4 import BeautifulSoup, UnicodeDammit
 from warcio.archiveiterator import ArchiveIterator
 import nltk
-from string import punctuation, digits
 from threading import Thread, Lock
 from collections import Counter
 import json
 import glob
 from queue import Queue
-import linecache
 import os
 from heapq import heappop, heappush, heapify
-# # tracemalloc.start()
 # from memory_profiler import profile
+from collections import defaultdict
 
-mini_index = {}
+mini_index = defaultdict(list)
 mutex_index = Lock()
 MAX_THREADS = 5
 num_threads = 0
+count_files = 0
 mutex_count_threads = Lock()
+
 stopwords = set(nltk.corpus.stopwords.words('portuguese'))
+
 MEGABYTE = 1024 * 1024
 def memory_limit(value):
     limit = value * MEGABYTE
@@ -34,23 +34,18 @@ def peak_virtual_memory_mb():
         return vmpeak
 
 def preprocess(text):
-    tokens = nltk.RegexpTokenizer(r'\w+').tokenize(text.lower()) # lowercase and tokenize
+    tokens = nltk.RegexpTokenizer(r'\w+').tokenize(text) #tokenize
 
     stemmer = nltk.SnowballStemmer('portuguese')
-    stem_tokens = [stemmer.stem(token) for token in tokens if token not in stopwords] # remove stopwords and stemming
-    return Counter(stem_tokens).most_common()
+    stem_tokens = [stemmer.stem(token.lower()) for token in tokens if token not in stopwords] # lowercase, remove stopwords and stemming
+    return Counter(stem_tokens).most_common(), len(stem_tokens)
 
 def write_index_to_file():
-    global docid
-    # with open('index_'+str(int(docid/10000))+'.pkl', 'wb') as fp:
-    #     pickle.dump(mini_index, fp)
-    # with open('data0.json', 'w') as fp:
-    #     json.dump(mini_index, fp, sort_keys=True)
-    if not os.path.exists('./data/test'):
-        os.makedirs('./data/test')
+    if not os.path.exists('./data_final'):
+        os.makedirs('./data_final')
     keys_sorted = sorted(mini_index)
 
-    with open('data/test/'+str(int(docid/10))+'.txt', 'w') as fp:
+    with open('data_final/'+str(count_files)+'.txt', 'w') as fp:
         for key in keys_sorted:
             fp.write(json.dumps({key: mini_index[key]})+'\n')
         fp.write('$\n')
@@ -58,30 +53,28 @@ def write_index_to_file():
 
 def create_mini_inverted_index(warc_file: str, memory_limit: int):
     global docid
+    global count_files
     
     with open(warc_file, 'rb') as f:
         for record in ArchiveIterator(f):
             if record.rec_type == 'response':
                 url = record.rec_headers.get_header('WARC-Target-URI')
-                postings = preprocess(record.raw_stream.read().decode('utf-8'))
+                text = record.raw_stream.read().decode()
+                postings, length = preprocess(text)
                 
                 # monta indice invertido para o record i
                 # salva a url e incrementa o docid
                 mutex_index.acquire()
 
-                if docid%10 == 0 and docid != 0:
+                if docid%10000 == 0 and docid != 0:
                     write_index_to_file()
-                    # break
+                    count_files += 1
 
-               
                 for token, tf in postings:
-                    try:
-                        mini_index[token].append((docid, tf))
-                    except:
-                        mini_index[token] = [(docid, tf)]
+                    mini_index[token].append((docid, tf))
 
                 with open('save_url_to_docid.txt', 'a') as docid_to_url:
-                    docid_to_url.write(str(docid)+': '+url+'\n')
+                    docid_to_url.write(str(docid)+': '+url+': '+str(length)+'\n')
 
                 print(docid)
                 docid += 1 # incrementa docid porque um arquivo a mais ja foi indexado
@@ -98,6 +91,7 @@ def merge_index(index):
     filelist = glob.glob(index+'/*.txt')
     files_sorted = sorted(filelist, key=lambda x: int(os.path.basename(x).replace('.txt', '')))
     print(files_sorted)
+    print("Vamos começar a indexar")
     iterator = [0 for i in range(len(files_sorted))]
     updated = [1 for i in range(len(files_sorted))]
     smallest_token = []
@@ -119,17 +113,25 @@ def merge_index(index):
             f_index.seek(iterator[i])
             line = f_index.readline() 
             f_index.close()
-            # print(line)
-            # line = linecache.getline(f, iterator[i])
             if line == "$\n":
                 # fim do arquivo
                 iterator[i] = -1
                 lines.append((i, 0, []))
                 continue
 
+            # if line == "\n":
+            #     iterator[i] += 1
+            #     lines.append((i, 0, []))
+            #     continue
+
             updated[i] = 0
             length = len(line)
             line = json.loads(line)
+            # except json.decoder.JSONDecodeError: 
+            #     print(line, f, iterator[i])
+            #     line = json.loads(line)
+                # continue
+            # print(line)
             lines.append((i, length, line))
 
             key = list(line.keys())[0]
@@ -148,20 +150,56 @@ def merge_index(index):
             if list(l.keys())[0] == key:
                 actual_inverted_list.extend(l[key])
                 iterator[i] += length
-                # print(iterator[i])
                 updated[i] = 1
-        if actual_inverted_list != []:
-            with open('index_test_processor.txt', 'a') as f:
-                save_line = json.dumps({key: actual_inverted_list})+'\n'
-                f.write(save_line)
-            
-            with open('save_token_offset.txt', 'a') as f:
-                f.write(key+': '+str(seek_pointer)+'\n')
+
+        # if actual_inverted_list != []:
+        with open('index_final2.txt', 'a') as f:
+            save_line = json.dumps({key: actual_inverted_list})+'\n'
+            f.write(save_line)
+        
+        with open('save_token_offset.txt', 'a') as f:
+            f.write(key+': '+str(seek_pointer)+'\n')
+
         seek_pointer += len(save_line)
         actual_inverted_list.clear()
         aux = lines.copy()
         lines.clear()
     smallest_token.clear()
+
+def wait_threads_end():
+   
+    while(1):
+        # print(num_threads)
+        mutex_count_threads.acquire()
+        if num_threads == 0:
+            mutex_count_threads.release()
+            break
+        mutex_count_threads.release()
+
+def warcs_scheduler(corpus, memory_limit):
+    global num_threads
+    next_file = Queue()
+    files = glob.glob(corpus+'/*.kaggle')
+    
+    for f in files:
+        next_file.put(f)
+
+    while not next_file.empty():
+
+        f = next_file.get()
+
+        while(1):
+            mutex_count_threads.acquire()
+            if num_threads < MAX_THREADS:
+                num_threads += 1
+                mutex_count_threads.release()
+                break
+            mutex_count_threads.release()
+
+        t = Thread (target = create_mini_inverted_index, args = (f, memory_limit, ))
+        t.start()
+    
+    wait_threads_end()
 
 # @profile
 def main(memory_limit, corpus):
@@ -170,39 +208,13 @@ def main(memory_limit, corpus):
     """
     global docid
     docid = 0
-    # a quantidade de arquivos salvos varia com o tamanho do corpus
-    global num_threads
-    next_file = Queue()
-    files = glob.glob(corpus+'/*.kaggle')
     
-    # for f in files:
-    #     next_file.put(f)
+    # create_mini_inverted_index(corpus+'/part-0.warc.gz.kaggle', 1024)
+    # warcs_scheduler(corpus, memory_limit)
+    # if len(mini_index) != 0:
+    #     write_index_to_file()
 
-    # while not next_file.empty():
-    #     #ler tudo e colocar numa fila e ir tirando e criando threads
-    #     f = next_file.get()
-    #     print(f)
-    #     while(1):
-    #         mutex_count_threads.acquire()
-            
-    #         if num_threads < MAX_THREADS:
-    #             print("Criei nova thread")
-    #             num_threads += 1
-    #             mutex_count_threads.release()
-    #             break
-    #         mutex_count_threads.release()
-
-    #     t = Thread (target = create_mini_inverted_index, args = (f, memory_limit, ))
-    #     t.start()
-    
-    # fazer threadpool para esperar as threads acabarem pra ver se tem um restinho nos indices e salvar
-
-    #     break
-    merge_index('/home/isadorasalles/Documents/1_Sem_Mestrado/RI/pa2/data/test')
-        # create_mini_inverted_index(f, memory_limit)
-
-## ler o WARC
-## tokenizar, pre-processar e indexar
+    merge_index('/home/isadorasalles/Documents/1_Sem_Mestrado/RI/pa2/data_final')
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process some integers.')
