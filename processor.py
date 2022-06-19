@@ -13,32 +13,19 @@ from collections import Counter
 
 stopwords = nltk.corpus.stopwords.words('portuguese')
 next_query = Queue()
-count_queries_processed = 0
-mutex_count_queries = Lock()
 
-MAX_THREADS = 5
-num_threads = 0
-mutex_count_threads = Lock()
+MAX_THREADS = 4
 
 mutex_print_stdout = Lock()
 
 docid_to_url = {}
 token_to_offsets = {}
-tokens = set()
-
-def check_end_query_processing():
-    mutex_count_queries.acquire()
-    if count_queries_processed < num_queries:
-        mutex_count_queries.release()
-        return False
-    mutex_count_queries.release()
-    return True
 
 def preprocess(text):
-    tokens = nltk.RegexpTokenizer(r'\w+').tokenize(text) #tokenize
+    tokens = nltk.RegexpTokenizer(r'\w+').tokenize(text.lower()) #tokenize and lowercase
 
     stemmer = nltk.SnowballStemmer('portuguese')
-    stem_tokens = [stemmer.stem(token.lower()) for token in tokens if token not in stopwords] # lowercase, remove stopwords and stemming
+    stem_tokens = [stemmer.stem(token) for token in tokens if token not in stopwords] # remove stopwords and stemming
     return stem_tokens
 
 def query_preprocess(queries):
@@ -51,7 +38,7 @@ def query_preprocess(queries):
     return terms_used
 
 def compute_idf(postings):
-    return math.log(len_index/len(postings)) # numero de documentos que a palavra acontece 
+    return math.log((len_index+1)/len(postings)) # len(postings) = numero de documentos que a palavra acontece 
 
 def compute_tf_idf(tf, postings):
     idf = compute_idf(postings)
@@ -65,16 +52,24 @@ def compute_bm25(tf, docid, postings):
     return (tf * (k1 + 1)/(tf + k1 *(1 - b + b*(length/avg_doc_length))))*idf
 
 def get_min_docid_from_pointers(pointers, query):
-    d = []
-    for i, term in enumerate(query):
-        if pointers[i] < len(postings[term]):
-            d.append(postings[term][pointers[i]][0])
-    if d == []:
-        return None
-    return min(d)
+    # retorna o menor docid igual a todas as listas invertidas
+    while(1):
+        d = []
+        for i, term in enumerate(query):
+            if pointers[i] < len(postings[term]):
+                d.append(postings[term][pointers[i]][0])
+            else:
+                return None
+        if d.count(d[0]) == len(d): # todos os docids sao iguais entao retorna
+            return d[0]
+        else:
+            for i, e in enumerate(d):
+                if e == min(d): # se eh minimo e diferente dos outros anda com o ponteiro
+                    pointers[i]+=1
 
 def daat_thread(original, query, index, ranker):
     docs = []
+    docs.clear()
     heapify(docs)
     new_query = []
     for term in query:
@@ -87,6 +82,7 @@ def daat_thread(original, query, index, ranker):
         docid = get_min_docid_from_pointers(pointers, new_query)
         if docid == None:
             break
+        
         score = 0
         for i, term in enumerate(new_query):
             if pointers[i] < len(postings[term]):
@@ -99,79 +95,31 @@ def daat_thread(original, query, index, ranker):
                     pointers[i] += 1
         heappush(docs, (-1*score, docid))
     
-    
+
     results = []
+    
     for i in range(min(len(docs), 10)):
         (score, docid) = heappop(docs)
         results.append({"URL": docid_to_url[docid][0], "Score": -1*score})
-
+    
+    mutex_print_stdout.acquire()
     to_print = {
         "Query": original, 
         "Results": results
     }
-    mutex_print_stdout.acquire()
-    print('\n\n')
     print(json.dumps(to_print, ensure_ascii=False))
+    results.clear()
     mutex_print_stdout.release()
-
-    global num_threads
-    mutex_count_threads.acquire()
-    num_threads -= 1
-    mutex_count_threads.release()
-
-    global count_queries_processed
-    mutex_count_queries.acquire()
-    count_queries_processed += 1
-    mutex_count_queries.release()
    
-    
-def wait_threads_end():
-    while(1):
-        mutex_count_threads.acquire()
-        if num_threads == 0:
-            mutex_count_threads.release()
-            break
-        mutex_count_threads.release()
 
 def queries_scheduler(index, ranker):
-    # with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
-    while(1):
+    with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+        while not next_query.empty():
+            # pega a proxima consulta na fila
+            query, query_p = next_query.get()
 
-        if check_end_query_processing():
-            wait_threads_end()
-            break
-
-        end = 0
-        while(1):
-            # espera enquanto a fila esta vazia
-            if not next_query.empty():
-                break
-            if check_end_query_processing():
-                end = 1
-                break
-
-        if end == 1:
-            wait_threads_end()
-            break
-            
-        # pega a proxima consulta na fila
-        query, query_p = next_query.get()
-       
-        # verifica se pode criar mais uma thread, caso contrário espera 
-        global num_threads
-        while(1):
-            mutex_count_threads.acquire()
-            if num_threads < MAX_THREADS:
-                num_threads += 1
-                mutex_count_threads.release()
-                break
-            mutex_count_threads.release()
-        
-        
-        # cria uma thread para processar a consulta atual
-        # executor.submit(daat_thread, query, query_p, index, ranker)
-        t = Thread (target = daat_thread, args = (query, query_p, index, ranker)) 
-        t.start()
+            # cria uma thread para processar a consulta atual
+            executor.submit(daat_thread, query, query_p, index, ranker)
 
 def get_postings(index, terms_used):
     global postings
@@ -191,6 +139,7 @@ def main(path_queries, index, ranker):
 
     global num_queries 
     num_queries = len(queries)
+    # pre processamento dos termos das consultas
     terms_used = query_preprocess(queries)
     queries.clear()
     
@@ -219,15 +168,10 @@ def main(path_queries, index, ranker):
             token_to_offsets[splitted[0]] = int(splitted[1].replace('\n', ''))
     offsets.clear()
 
+    # salva apenas listas invertidas de tokens que aparecem em alguma consulta
     get_postings(index, terms_used)
     terms_used.clear()
     token_to_offsets.clear()
-
-    # global num_threads
-    # num_threads += 1
-    # query_preprocess_thread(queries)
-    # t = Thread (target = query_preprocess_thread, args = (queries,), daemon = True) 
-    # t.start()
 
     queries_scheduler(index, ranker)
 
