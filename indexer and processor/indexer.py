@@ -67,16 +67,17 @@ def create_mini_inverted_index(warc_file: str, memory_limit: int):
                 # se atingir 70% da memoria disponivel, salva num arquivo
                 process = psutil.Process(os.getpid())
                 if process.memory_info().vms/MEGABYTE > 0.7*memory_limit:
-                    write_index_to_file()
+                    # write_index_to_file()
                     count_files += 1
+                    mini_index.clear()
                     
                 # salva tokens no indice global
                 for token, tf in postings:
                     mini_index[token].append((docid, tf))
 
                 # salva linha contendo docid para URLs e tamanho dos documentos
-                with open('save_url_to_docid.txt', 'a') as docid_to_url:
-                    docid_to_url.write(str(docid)+': '+url+': '+str(length)+'\n')
+                # with open('save_url_to_docid.txt', 'a') as docid_to_url:
+                #     docid_to_url.write(str(docid)+': '+url+': '+str(length)+'\n')
 
                 if docid%1000 == 0:
                     print('Ja indexamos: ', docid)
@@ -204,12 +205,12 @@ def main(memory_limit, corpus, index):
     if len(mini_index) != 0:
         write_index_to_file()
 
-    merge_index('./partial_index', index)
+    # merge_index('./partial_index', index)
 
-    to_print = {"Index Size": os.path.getsize(index)/MEGABYTE,
-                "Elapsed Time": time.time() - start_indexing,
-                "Number of Lists": num_inverted_lists,
-                "Average List Size": avg_size_lists/num_inverted_lists}
+    # to_print = {"Index Size": os.path.getsize(index)/MEGABYTE,
+    #             "Elapsed Time": time.time() - start_indexing,
+    #             "Number of Lists": num_inverted_lists,
+    #             "Average List Size": avg_size_lists/num_inverted_lists}
         
     print(json.dumps(to_print, ensure_ascii=False))
 
